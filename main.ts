@@ -27,6 +27,8 @@ const COMMIT_EPOCH = 1700000000;
 const TRIAL_NOW = process.env.MAKEFUN_TRIAL_NOW ?? '2026-11-14T06:30:00.000Z';
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 const PKT_MAX = 65520;
+const PACK_MAGIC = Buffer.from('PACK', 'ascii');
+const SIDEBAND_ONE = Buffer.from([1]);
 
 type Json = Record<string, unknown>;
 type GitType = 'commit' | 'tree' | 'blob' | 'tag';
@@ -77,8 +79,11 @@ function pktLine(payload: string | Buffer): Buffer {
   return Buffer.concat([head, data]);
 }
 
+const PKT_FLUSH_BUF = Buffer.from('0000', 'ascii');
+
 function pktFlush(): Buffer {
-  return Buffer.from('0000', 'ascii');
+  // Shared: callers only ever pass it to Buffer.concat (which copies).
+  return PKT_FLUSH_BUF;
 }
 
 function pktDelim(): Buffer {
@@ -92,6 +97,8 @@ interface PktDecoded {
 }
 
 /** Decode a whole buffer of pkt-lines. `rest` holds trailing bytes that are not pkt-lines. */
+const EMPTY_BUFFER = Buffer.alloc(0);
+
 function decodePktLines(buf: Buffer): PktDecoded {
   const packets: PktDecoded['packets'] = [];
   let off = 0;
@@ -100,17 +107,17 @@ function decodePktLines(buf: Buffer): PktDecoded {
     if (!/^[0-9a-fA-F]{4}$/.test(head)) break;
     const len = Number.parseInt(head, 16);
     if (len === 0) {
-      packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'flush', payload: EMPTY_BUFFER });
       off += 4;
       continue;
     }
     if (len === 1) {
-      packets.push({ kind: 'delim', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'delim', payload: EMPTY_BUFFER });
       off += 4;
       continue;
     }
     if (len === 2) {
-      packets.push({ kind: 'end', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'end', payload: EMPTY_BUFFER });
       off += 4;
       continue;
     }
@@ -839,21 +846,30 @@ interface ReqCtx {
   res: ServerResponse;
   method: string;
   pathname: string;
-  query: URLSearchParams;
+  queryString: string;
+  queryCache: URLSearchParams | null;
   segments: string[];
   body: Buffer;
   json: Json | null;
   jsonError: boolean;
 }
 
+/** Lazily parse the query string (most hot paths never touch it). */
+function queryGet(ctx: ReqCtx, name: string): string | null {
+  if (ctx.queryCache === null) ctx.queryCache = new URLSearchParams(ctx.queryString);
+  return ctx.queryCache.get(name);
+}
+
 function sendBuffer(ctx: ReqCtx, status: number, body: Buffer, contentType: string, extra?: Record<string, string>): void {
   const res = ctx.res;
-  res.writeHead(status, {
+  const headers: Record<string, string | number> = {
     'content-type': contentType,
     'x-github-request-id': `req-${++requestCounter}`,
     'content-length': body.length,
-    ...(extra ?? {}),
-  });
+  };
+  // Avoid the spread (and the `?? {}` empty object) on the common no-extra path.
+  if (extra !== undefined) Object.assign(headers, extra);
+  res.writeHead(status, headers);
   res.end(body);
 }
 
@@ -865,10 +881,12 @@ function sendError(ctx: ReqCtx, status: number, message: string): void {
   sendJson(ctx, status, { message });
 }
 
+const BEARER_TOKEN = TOKEN === '' ? '' : `Bearer ${TOKEN}`;
+
 function authorized(ctx: ReqCtx): boolean {
   if (TOKEN === '') return true;
   const header = ctx.req.headers.authorization;
-  return header === `Bearer ${TOKEN}`;
+  return header === BEARER_TOKEN;
 }
 
 function decodeSegment(value: string): string {
@@ -880,7 +898,10 @@ function decodeSegment(value: string): string {
 }
 
 function parsePath(pathname: string): string[] {
-  return pathname.split('/').filter((s) => s !== '').map(decodeSegment);
+  const raw = pathname.split('/').filter((s) => s !== '');
+  // Most paths have no %-escapes; decodeURIComponent costs ~0.2µs per segment.
+  if (pathname.indexOf('%') < 0) return raw;
+  return raw.map(decodeSegment);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -979,8 +1000,8 @@ function handleUserRepos(ctx: ReqCtx): void {
     return;
   }
   if (ctx.method === 'GET') {
-    const perPage = Math.max(1, Math.min(100, Number(ctx.query.get('per_page') ?? '30') || 30));
-    const page = Math.max(1, Number(ctx.query.get('page') ?? '1') || 1);
+    const perPage = Math.max(1, Math.min(100, Number(queryGet(ctx, 'per_page') ?? '30') || 30));
+    const page = Math.max(1, Number(queryGet(ctx, 'page') ?? '1') || 1);
     const mine = [...repos.values()].filter((r) => r.owner === VIEWER_LOGIN).sort((a, b) => a.seq - b.seq);
     const start = (page - 1) * perPage;
     const slice = mine.slice(start, start + perPage);
@@ -1067,7 +1088,7 @@ function handleCommits(ctx: ReqCtx, repo: Repo): void {
     sendError(ctx, 405, 'Method Not Allowed');
     return;
   }
-  const ref = ctx.query.get('sha') ?? repo.defaultBranch;
+  const ref = queryGet(ctx, 'sha') ?? repo.defaultBranch;
   const tip = refShaOf(repo, ref) ?? (isOid(ref) ? ref : undefined);
   if (tip === undefined || !repo.objects.has(tip)) {
     sendJson(ctx, 200, []);
@@ -1133,7 +1154,7 @@ function handleGitRefs(ctx: ReqCtx, repo: Repo, rest: string[]): void {
 
 function handleContents(ctx: ReqCtx, repo: Repo, pathParts: string[]): void {
   const path = pathParts.join('/');
-  const refParam = ctx.query.get('ref') ?? undefined;
+  const refParam = queryGet(ctx, 'ref') ?? undefined;
   const branch = refParam ?? repo.defaultBranch;
   if (ctx.method === 'GET') {
     const tip = refShaOf(repo, branch) ?? (isOid(branch) ? branch : undefined);
@@ -1301,11 +1322,11 @@ function handleIssues(ctx: ReqCtx, repo: Repo): void {
     return;
   }
   if (ctx.method === 'GET') {
-    const state = ctx.query.get('state') ?? 'open';
-    const sort = ctx.query.get('sort') ?? 'created';
-    const direction = ctx.query.get('direction') ?? 'desc';
-    const perPage = Math.max(1, Math.min(100, Number(ctx.query.get('per_page') ?? '30') || 30));
-    const page = Math.max(1, Number(ctx.query.get('page') ?? '1') || 1);
+    const state = queryGet(ctx, 'state') ?? 'open';
+    const sort = queryGet(ctx, 'sort') ?? 'created';
+    const direction = queryGet(ctx, 'direction') ?? 'desc';
+    const perPage = Math.max(1, Math.min(100, Number(queryGet(ctx, 'per_page') ?? '30') || 30));
+    const page = Math.max(1, Number(queryGet(ctx, 'page') ?? '1') || 1);
     let list = repo.issues;
     if (state !== 'all') list = list.filter((i) => i.state === state);
     if (sort === 'created') {
@@ -1451,7 +1472,7 @@ function handlePulls(ctx: ReqCtx, repo: Repo): void {
     return;
   }
   if (ctx.method === 'GET') {
-    const state = ctx.query.get('state') ?? 'open';
+    const state = queryGet(ctx, 'state') ?? 'open';
     let list = repo.pulls;
     if (state !== 'all') list = list.filter((p) => p.state === state);
     sendJson(ctx, 200, list.map((pull) => pullJson(pull, repo)));
@@ -1887,7 +1908,7 @@ function handleReceivePack(ctx: ReqCtx, repo: Repo): void {
     return;
   }
     // The pack bytes follow the flush after the commands; they start with the PACK magic.
-  const packIdx = ctx.body.indexOf(Buffer.from('PACK', 'ascii'));
+  const packIdx = ctx.body.indexOf(PACK_MAGIC);
   const packBytes = packIdx >= 0 ? ctx.body.subarray(packIdx) : Buffer.alloc(0);
   if (updates.length > 0 && packBytes.length > 0) {
     try {
@@ -1944,7 +1965,7 @@ function handleReceivePack(ctx: ReqCtx, repo: Repo): void {
 function reportBuffer(lines: string[]): Buffer {
   const parts: Buffer[] = [];
   for (const line of lines) {
-    const framed = Buffer.concat([Buffer.from([1]), Buffer.from(`${line}\n`, 'utf8')]);
+    const framed = Buffer.concat([SIDEBAND_ONE, Buffer.from(`${line}\n`, 'utf8')]);
     parts.push(pktLine(framed));
   }
   parts.push(pktFlush());
@@ -1960,7 +1981,7 @@ function dispatchGit(ctx: ReqCtx): boolean {
   const tail = seg.slice(2);
   const repo = resolveRepo(ctx, owner, repoName);
   if (tail.length === 2 && tail[0] === 'info' && tail[1] === 'refs') {
-    const service = ctx.query.get('service') ?? '';
+    const service = queryGet(ctx, 'service') ?? '';
     if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
       sendError(ctx, 400, 'service parameter required');
       return true;
@@ -2971,23 +2992,51 @@ function handleMcp(ctx: ReqCtx): void {
 // -------------------------------------------------------------------------------------------
 
 async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
+  // Running total (the old code re-reduced the chunk list per chunk: O(n^2))
+  // and a single-chunk fast path (most requests are one chunk).
+  let total = 0;
+  let first: Buffer | null = null;
+  let chunks: Buffer[] | null = null;
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    if (chunks.reduce((n, c) => n + c.length, 0) > 64 * 1024 * 1024) throw new Error('request body too large');
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (total > 64 * 1024 * 1024) throw new Error('request body too large');
+    if (first === null) {
+      first = buf;
+    } else {
+      if (chunks === null) chunks = [first];
+      chunks.push(buf);
+    }
   }
-  return Buffer.concat(chunks);
+  if (first === null) return Buffer.alloc(0);
+  if (chunks === null) return first;
+  return Buffer.concat(chunks, total);
 }
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+  // Manual URL split: `new URL` + URLSearchParams cost ~1.3µs per request and
+  // the query is rarely needed (only info/refs `service` on the hot paths).
+  // Absolute-form URLs (proxy-style) fall back to the URL constructor.
+  const rawUrl = req.url ?? '/';
+  let pathname: string;
+  let queryString = '';
+  if (rawUrl.startsWith('http://') || rawUrl.startsWith('https://')) {
+    const u = new URL(rawUrl);
+    pathname = u.pathname;
+    queryString = u.search.slice(1);
+  } else {
+    const qi = rawUrl.indexOf('?');
+    pathname = qi < 0 ? rawUrl : rawUrl.slice(0, qi);
+    queryString = qi < 0 ? '' : rawUrl.slice(qi + 1);
+  }
   const ctx: ReqCtx = {
     req,
     res,
     method: req.method ?? 'GET',
-    pathname: url.pathname,
-    query: url.searchParams,
-    segments: parsePath(url.pathname),
+    pathname,
+    queryString,
+    queryCache: null,
+    segments: parsePath(pathname),
     body: Buffer.alloc(0),
     json: null,
     jsonError: false,
