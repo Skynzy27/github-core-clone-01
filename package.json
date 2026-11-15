@@ -1,0 +1,1 @@
+{"description":"GitHub-compatible git forge: git smart HTTP, REST v3, GraphQL v4, MCP — make.fun github-core-clone-01","engines":{"node":">=22"},"main":"main.ts","name":"forge","private":true,"type":"module","version":"1.0.0"}
