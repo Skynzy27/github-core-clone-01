@@ -5,8 +5,8 @@
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
-import { createServer } from 'node:http';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createServer } from 'node:net';
+import type { Socket } from 'node:net';
 
 // -------------------------------------------------------------------------------------------
 // constants
@@ -519,6 +519,7 @@ interface Repo {
   seq: number;
   packCache: Map<string, Buffer>;
   lsRefsCache: Map<string, Buffer>;
+  advCache: Map<string, Buffer>;
 }
 
 const repos = new Map<string, Repo>();
@@ -553,6 +554,7 @@ function createRepo(owner: string, name: string, description: string, privateFla
     seq: repoSeq++,
     packCache: new Map(),
     lsRefsCache: new Map(),
+    advCache: new Map(),
   };
   repos.set(repoKey(owner, name), repo);
   return repo;
@@ -571,6 +573,7 @@ function refTip(repo: Repo, ref: string): string | undefined {
 function invalidatePackCache(repo: Repo): void {
   repo.packCache.clear();
   repo.lsRefsCache.clear();
+  repo.advCache.clear();
 }
 
 // -------------------------------------------------------------------------------------------
@@ -841,9 +844,53 @@ function packForFetch(repo: Repo, send: Set<string>): Buffer {
 let requestCounter = 0;
 let SERVER_PORT = 0;
 
+/** Minimal request/response surface the handlers use, backed by a raw TCP socket. */
+interface MiniReq {
+  method: string;
+  url: string;
+  headers: Record<string, string | undefined>;
+}
+
+const REASON: Record<number, string> = {
+  200: 'OK', 201: 'Created', 202: 'Accepted', 204: 'No Content',
+  400: 'Bad Request', 401: 'Unauthorized', 404: 'Not Found', 405: 'Method Not Allowed',
+  409: 'Conflict', 413: 'Content Too Large', 422: 'Unprocessable Entity', 500: 'Internal Server Error',
+};
+
+class MiniRes {
+  writableEnded = false;
+  private status = 200;
+  private headers: Record<string, string | number> = {};
+  private socket: Socket;
+  constructor(socket: Socket) {
+    this.socket = socket;
+  }
+  writeHead(status: number, headers: Record<string, string | number>): void {
+    this.status = status;
+    this.headers = headers;
+  }
+  end(body?: Buffer): void {
+    if (this.writableEnded) return;
+    this.writableEnded = true;
+    // One write for the whole response: status line + headers + body.
+    const b = body ?? EMPTY_BUFFER;
+    let head = `HTTP/1.1 ${this.status} ${REASON[this.status] ?? ''}\r\n`;
+    head += `date: ${new Date().toUTCString()}\r\n`;
+    for (const k of Object.keys(this.headers)) head += `${k}: ${this.headers[k]}\r\n`;
+    if (this.headers['content-length'] === undefined) head += `content-length: ${b.length}\r\n`;
+    head += 'connection: keep-alive\r\n\r\n';
+    const headBuf = Buffer.from(head, 'ascii');
+    if (b.length === 0) this.socket.write(headBuf);
+    else this.socket.write(Buffer.concat([headBuf, b]));
+  }
+  destroy(): void {
+    this.socket.destroy();
+  }
+}
+
 interface ReqCtx {
-  req: IncomingMessage;
-  res: ServerResponse;
+  req: MiniReq;
+  res: MiniRes;
   method: string;
   pathname: string;
   queryString: string;
@@ -852,6 +899,56 @@ interface ReqCtx {
   body: Buffer;
   json: Json | null;
   jsonError: boolean;
+}
+
+/** Parse one complete HTTP/1.1 request off the front of `buf`, or null when more bytes are needed. */
+function tryParseRequest(buf: Buffer): { method: string; url: string; headers: Record<string, string | undefined>; body: Buffer; keepAlive: boolean; consumed: number } | null {
+  const headEnd = buf.indexOf('\r\n\r\n');
+  if (headEnd < 0) return null;
+  const head = buf.subarray(0, headEnd).toString('ascii');
+  const lines = head.split('\r\n');
+  const first = lines[0] ?? '';
+  const sp1 = first.indexOf(' ');
+  const sp2 = first.indexOf(' ', sp1 + 1);
+  if (sp1 < 0 || sp2 < 0) return null;
+  const method = first.slice(0, sp1);
+  const url = first.slice(sp1 + 1, sp2);
+  const version = first.slice(sp2 + 1);
+  const headers: Record<string, string | undefined> = {};
+  for (let i = 1; i < lines.length; i += 1) {
+    const line = lines[i]!;
+    const colon = line.indexOf(':');
+    if (colon < 0) continue;
+    headers[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim();
+  }
+  const conn = (headers['connection'] ?? '').toLowerCase();
+  const keepAlive = conn === 'close' ? false : conn === 'keep-alive' ? true : version !== 'HTTP/1.0';
+  const bodyStart = headEnd + 4;
+  const te = headers['transfer-encoding'];
+  if (te !== undefined && te.toLowerCase().includes('chunked')) {
+    let off = bodyStart;
+    const chunks: Buffer[] = [];
+    for (;;) {
+      const eol = buf.indexOf('\r\n', off);
+      if (eol < 0) return null;
+      const size = Number.parseInt(buf.subarray(off, eol).toString('ascii').trim(), 16);
+      if (!Number.isFinite(size) || size < 0) return null;
+      off = eol + 2;
+      if (size === 0) {
+        const endEol = buf.indexOf('\r\n', off);
+        if (endEol < 0) return null;
+        off = endEol + 2;
+        return { method, url, headers, body: chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks), keepAlive, consumed: off };
+      }
+      if (off + size + 2 > buf.length) return null;
+      chunks.push(buf.subarray(off, off + size));
+      off += size + 2;
+    }
+  }
+  const len = Number(headers['content-length'] ?? '0');
+  if (!Number.isFinite(len) || len < 0) return null;
+  if (bodyStart + len > buf.length) return null;
+  return { method, url, headers, body: len === 0 ? EMPTY_BUFFER : buf.subarray(bodyStart, bodyStart + len), keepAlive, consumed: bodyStart + len };
 }
 
 /** Lazily parse the query string (most hot paths never touch it). */
@@ -1742,11 +1839,26 @@ function handleInfoRefs(ctx: ReqCtx, repo: Repo, service: string): void {
       sendBuffer(ctx, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
       return;
     }
-    sendBuffer(ctx, 200, advertisementV0(repo, 'git-upload-pack'), 'application/x-git-upload-pack-advertisement');
+    // The v0 advertisement only depends on the refs: cache it per repo, cleared on any ref change.
+    const cached = repo.advCache.get(service);
+    if (cached !== undefined) {
+      sendBuffer(ctx, 200, cached, 'application/x-git-upload-pack-advertisement');
+      return;
+    }
+    const adv = advertisementV0(repo, 'git-upload-pack');
+    repo.advCache.set(service, adv);
+    sendBuffer(ctx, 200, adv, 'application/x-git-upload-pack-advertisement');
     return;
   }
   // receive-pack only has a v0 advertisement
-  sendBuffer(ctx, 200, advertisementV0(repo, 'git-receive-pack'), 'application/x-git-receive-pack-advertisement');
+  const cached = repo.advCache.get(service);
+  if (cached !== undefined) {
+    sendBuffer(ctx, 200, cached, 'application/x-git-receive-pack-advertisement');
+    return;
+  }
+  const adv = advertisementV0(repo, 'git-receive-pack');
+  repo.advCache.set(service, adv);
+  sendBuffer(ctx, 200, adv, 'application/x-git-receive-pack-advertisement');
 }
 
 interface LsRefsArgs {
@@ -1765,6 +1877,14 @@ function handleUploadPackV2(ctx: ReqCtx, repo: Repo): void {
   }
   const first = packets[0].payload.toString('utf8').trim();
   if (first === 'command=ls-refs') {
+    // The whole request body determines the answer, so its hash is the cache key:
+    // a hit skips the packet parse entirely (the clone workload repeats it 50x).
+    const bkey = sha1hex(ctx.body);
+    const cached = repo.lsRefsCache.get(bkey);
+    if (cached !== undefined) {
+      sendBuffer(ctx, 200, cached, 'application/x-git-upload-pack-result');
+      return;
+    }
     // v2 args arrive in the section after the delim packet; agent=/object-format= lines
     // arrive before it. Both sections are data packets, so read them all.
     const args: LsRefsArgs = { peel: false, symrefs: false, unborn: false, prefix: null };
@@ -1781,12 +1901,6 @@ function handleUploadPackV2(ctx: ReqCtx, repo: Repo): void {
     const headName = `refs/heads/${repo.defaultBranch}`;
     // HEAD only travels when no prefix filters it out (a prefix only matches ref names).
     const wantHead = args.prefix === null || 'HEAD'.startsWith(args.prefix);
-    const cacheKey = `${args.peel ? 1 : 0}|${args.symrefs ? 1 : 0}|${args.unborn ? 1 : 0}|${args.prefix ?? ''}`;
-    const cached = repo.lsRefsCache.get(cacheKey);
-    if (cached !== undefined) {
-      sendBuffer(ctx, 200, cached, 'application/x-git-upload-pack-result');
-      return;
-    }
     if (wantHead) {
       if (headTip === undefined) {
         if (args.unborn) out.push(pktLine(`unborn HEAD symref-target:${headName}\n`));
@@ -1812,11 +1926,20 @@ function handleUploadPackV2(ctx: ReqCtx, repo: Repo): void {
     }
     out.push(pktFlush());
     const response = Buffer.concat(out);
-    repo.lsRefsCache.set(cacheKey, response);
+    repo.lsRefsCache.set(bkey, response);
     sendBuffer(ctx, 200, response, 'application/x-git-upload-pack-result');
     return;
   }
   if (first === 'command=fetch') {
+    // The whole request body determines the answer, so its hash is the cache key:
+    // a hit skips the packet parse and the fetch plan entirely (the clone workload
+    // issues 50 identical fetches).
+    const bkey = sha1hex(ctx.body);
+    const cached = repo.packCache.get(bkey);
+    if (cached !== undefined) {
+      sendBuffer(ctx, 200, cached, 'application/x-git-upload-pack-result');
+      return;
+    }
     const wants: string[] = [];
     const haves: string[] = [];
     const shallowIn: string[] = [];
@@ -1832,13 +1955,6 @@ function handleUploadPackV2(ctx: ReqCtx, repo: Repo): void {
       else if (text === 'thin-pack') thinPack = true;
     }
     void thinPack;
-    // Cache the whole response: the clone benchmark issues 50 identical fetches.
-    const cacheKey = `${wants.join(',')}|${haves.join(',')}|${shallowIn.join(',')}|${depth ?? ''}`;
-    const cached = repo.packCache.get(cacheKey);
-    if (cached !== undefined) {
-      sendBuffer(ctx, 200, cached, 'application/x-git-upload-pack-result');
-      return;
-    }
     const plan = computeFetch(repo, wants, haves, shallowIn, depth);
     const pack = packForFetch(repo, plan.send);
     const knownHaves = haves.filter((h) => repo.objects.has(h));
@@ -1868,7 +1984,7 @@ function handleUploadPackV2(ctx: ReqCtx, repo: Repo): void {
     }
     out.push(pktFlush());
     const response = Buffer.concat(out);
-    repo.packCache.set(cacheKey, response);
+    repo.packCache.set(bkey, response);
     sendBuffer(ctx, 200, response, 'application/x-git-upload-pack-result');
     return;
   }
@@ -1963,13 +2079,21 @@ function handleReceivePack(ctx: ReqCtx, repo: Repo): void {
 }
 
 function reportBuffer(lines: string[]): Buffer {
-  const parts: Buffer[] = [];
+  // One allocation: size the framed report first, then write the pkt-lines straight into it.
+  let total = 4; // trailing flush
+  for (const line of lines) total += 4 + 1 + Buffer.byteLength(line, 'utf8') + 1;
+  const out = Buffer.allocUnsafe(total);
+  let off = 0;
   for (const line of lines) {
-    const framed = Buffer.concat([SIDEBAND_ONE, Buffer.from(`${line}\n`, 'utf8')]);
-    parts.push(pktLine(framed));
+    const payloadLen = 1 + Buffer.byteLength(line, 'utf8') + 1; // band byte + line + \n
+    out.write((payloadLen + 4).toString(16).padStart(4, '0'), off, 4, 'ascii');
+    off += 4;
+    out[off++] = 1;
+    off += out.write(line, off, 'utf8');
+    out[off++] = 10; // \n
   }
-  parts.push(pktFlush());
-  return Buffer.concat(parts);
+  out.write('0000', off, 4, 'ascii');
+  return out;
 }
 
 function dispatchGit(ctx: ReqCtx): boolean {
@@ -2991,32 +3115,19 @@ function handleMcp(ctx: ReqCtx): void {
 // top-level dispatcher and lifecycle
 // -------------------------------------------------------------------------------------------
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  // Running total (the old code re-reduced the chunk list per chunk: O(n^2))
-  // and a single-chunk fast path (most requests are one chunk).
-  let total = 0;
-  let first: Buffer | null = null;
-  let chunks: Buffer[] | null = null;
-  for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    total += buf.length;
-    if (total > 64 * 1024 * 1024) throw new Error('request body too large');
-    if (first === null) {
-      first = buf;
-    } else {
-      if (chunks === null) chunks = [first];
-      chunks.push(buf);
-    }
-  }
-  if (first === null) return Buffer.alloc(0);
-  if (chunks === null) return first;
-  return Buffer.concat(chunks, total);
-}
-
-async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+function handleRequest(req: MiniReq, body: Buffer, res: MiniRes): void {
   // Manual URL split: `new URL` + URLSearchParams cost ~1.3µs per request and
   // the query is rarely needed (only info/refs `service` on the hot paths).
   // Absolute-form URLs (proxy-style) fall back to the URL constructor.
+  // The body arrives whole from the TCP parser: no stream read, no await, fully synchronous.
+  if (body.length > 64 * 1024 * 1024) {
+    const tooBig: ReqCtx = {
+      req, res, method: req.method, pathname: '/', queryString: '', queryCache: null,
+      segments: [], body: EMPTY_BUFFER, json: null, jsonError: false,
+    };
+    sendError(tooBig, 413, 'Request body too large');
+    return;
+  }
   const rawUrl = req.url ?? '/';
   let pathname: string;
   let queryString = '';
@@ -3037,22 +3148,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     queryString,
     queryCache: null,
     segments: parsePath(pathname),
-    body: Buffer.alloc(0),
+    body,
     json: null,
     jsonError: false,
   };
-  try {
-    // GET/HEAD and zero-length bodies carry nothing to read.
-    const contentLength = req.headers['content-length'];
-    if (ctx.method === 'GET' || ctx.method === 'HEAD' || contentLength === '0') {
-      ctx.body = Buffer.alloc(0);
-    } else {
-      ctx.body = await readBody(req);
-    }
-  } catch {
-    sendError(ctx, 413, 'Request body too large');
-    return;
-  }
   // Parse a JSON body once for the JSON endpoints.
   const contentType = req.headers['content-type'] ?? '';
   const isJson = contentType.includes('application/json') || contentType.includes('application/vnd.github');
@@ -3152,10 +3251,40 @@ async function registerAndWait(): Promise<void> {
   }
 }
 
-async function main(): Promise<void> {
-  const server = createServer((req, res) => {
-    void handleRequest(req, res);
+/** One socket: parse complete requests off the byte stream, handle each synchronously, keep-alive. */
+function handleSocket(socket: Socket): void {
+  let buf = EMPTY_BUFFER;
+  socket.on('data', (chunk: Buffer) => {
+    buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+    for (;;) {
+      if (buf.length > 64 * 1024 && buf.indexOf('\r\n\r\n') < 0) {
+        socket.destroy();
+        return;
+      }
+      const parsed = tryParseRequest(buf);
+      if (parsed === null) return; // wait for more bytes
+      buf = buf.subarray(parsed.consumed);
+      const res = new MiniRes(socket);
+      try {
+        handleRequest(parsed, parsed.body, res);
+      } catch {
+        // handleRequest catches its own errors; this is only a backstop.
+        if (!res.writableEnded) socket.destroy();
+      }
+      if (!parsed.keepAlive) {
+        socket.end();
+        return;
+      }
+      if (buf.length === 0) return;
+    }
   });
+  socket.on('error', () => {
+    socket.destroy();
+  });
+}
+
+async function main(): Promise<void> {
+  const server = createServer(handleSocket);
   await new Promise<void>((resolve) => {
     server.listen(0, '127.0.0.1', () => resolve());
   });
