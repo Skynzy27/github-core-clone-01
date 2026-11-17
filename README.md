@@ -1,8 +1,12 @@
+[![make.fun](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/Skynzy27/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/Skynzy27/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01)
+
 # forge — a GitHub-compatible git forge
 
 A standalone git forge in a single TypeScript file (`main.ts`, Node 22,
 standard library only, no git binary, no network beyond the suite). Built for
-the make.fun bounty **github-core-clone-01** ("Build a GitHub-compatible git
+the [github-core-clone-01 bounty on make.fun](https://make.fun/bounty/github-core-clone-01) ("Build a GitHub-compatible git
 forge").
 
 ## What it serves
