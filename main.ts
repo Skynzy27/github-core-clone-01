@@ -348,9 +348,9 @@ function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject | undef
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`pack version ${version}`);
   const count = pack.readUInt32BE(8);
-  const trailer = pack.subarray(pack.length - 20).toString('hex');
-  const computed = sha1hex(pack.subarray(0, pack.length - 20));
-  if (trailer !== computed) throw new Error('pack trailer checksum mismatch');
+  // v5: compare trailer bytes directly instead of via two hex strings.
+  const computed = createHash('sha1').update(pack.subarray(0, pack.length - 20)).digest();
+  if (!pack.subarray(pack.length - 20).equals(computed)) throw new Error('pack trailer checksum mismatch');
   const objects = new Map<string, GitObject>();
   const byOffset = new Map<number, GitObject>();
   let deltaCount = 0;
@@ -874,13 +874,14 @@ class MiniRes {
     this.writableEnded = true;
     // One write for the whole response: status line + headers + body.
     const b = body ?? EMPTY_BUFFER;
+    // v5: no Date header (xuen-zz omits it too; saves a Date format per response).
     let head = `HTTP/1.1 ${this.status} ${REASON[this.status] ?? ''}\r\n`;
-    head += `date: ${new Date().toUTCString()}\r\n`;
     for (const k of Object.keys(this.headers)) head += `${k}: ${this.headers[k]}\r\n`;
     if (this.headers['content-length'] === undefined) head += `content-length: ${b.length}\r\n`;
     head += 'connection: keep-alive\r\n\r\n';
     const headBuf = Buffer.from(head, 'ascii');
     if (b.length === 0) this.socket.write(headBuf);
+    else if (b.length > 4096) { this.socket.write(headBuf); this.socket.write(b); }
     else this.socket.write(Buffer.concat([headBuf, b]));
   }
   destroy(): void {
